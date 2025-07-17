@@ -1,237 +1,177 @@
-use std::path::PathBuf;
+use color_eyre::Result;
+use crossterm::event::KeyEvent;
+use ratatui::prelude::Rect;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
 
-use color_eyre::{Result, eyre::eyre, owo_colors::OwoColorize};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use git2::Repository;
-use ratatui::{
-    DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style, Stylize},
-    symbols,
-    text::Line,
-    widgets::{Block, List, ListItem, ListState, Paragraph},
+use crate::{
+    action::Action,
+    components::{Component, fps::FpsCounter, home::Home},
+    config::Config,
+    tui::{Event, Tui},
 };
 
-#[derive(Debug, Clone)]
-pub struct Worktree {
-    name: String,
-    path: PathBuf,
-    is_current: bool,
-}
-
-/// The current screen of the application.
-#[derive(Debug)]
-enum CurrentScreen {
-    WorktreeList,
-}
-
-/// The main application which holds the state and logic of the application.
-#[derive(Debug)]
 pub struct App {
-    /// Is the application running?
-    running: bool,
-    /// The current screen of the application.
-    current_screen: CurrentScreen,
-    /// List of worktrees. (dummy for now)
-    worktrees: Vec<Worktree>,
-    /// List state for navigation.
-    list_state: ListState,
+    config: Config,
+    tick_rate: f64,
+    frame_rate: f64,
+    components: Vec<Box<dyn Component>>,
+    should_quit: bool,
+    should_suspend: bool,
+    mode: Mode,
+    last_tick_key_events: Vec<KeyEvent>,
+    action_tx: mpsc::UnboundedSender<Action>,
+    action_rx: mpsc::UnboundedReceiver<Action>,
+}
+
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Mode {
+    #[default]
+    Home,
 }
 
 impl App {
-    /// Construct a new instance of [`App`].
-    pub fn new() -> Result<Self> {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
-
-        let worktrees = Self::load_worktrees()?;
-
-        if !worktrees.is_empty() {
-            list_state.select(Some(0));
-        }
-
+    pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
         Ok(Self {
-            running: false,
-            current_screen: CurrentScreen::WorktreeList,
-            worktrees,
-            list_state,
+            tick_rate,
+            frame_rate,
+            components: vec![Box::new(Home::new()), Box::new(FpsCounter::default())],
+            should_quit: false,
+            should_suspend: false,
+            config: Config::new()?,
+            mode: Mode::Home,
+            last_tick_key_events: Vec::new(),
+            action_tx,
+            action_rx,
         })
     }
 
-    fn load_worktrees() -> Result<Vec<Worktree>> {
-        let repo = Repository::open_from_env().or_else(|_| Repository::discover("."))?;
+    pub async fn run(&mut self) -> Result<()> {
+        let mut tui = Tui::new()?
+            // .mouse(true) // uncomment this line to enable mouse support
+            .tick_rate(self.tick_rate)
+            .frame_rate(self.frame_rate);
+        tui.enter()?;
 
-        let mut worktrees = Vec::new();
-
-        // Get the main worktree (repo root)
-        let workdir = repo
-            .workdir()
-            .ok_or_else(|| eyre!("Reoisitory has no workdir"))?;
-
-        let current_branch = repo
-            .head()
-            .ok()
-            .and_then(|head| head.shorthand().map(|s| s.to_string()))
-            .unwrap_or_else(|| "HEAD".to_string());
-
-        worktrees.push(Worktree {
-            name: current_branch.clone(),
-            path: workdir.to_path_buf(),
-            is_current: true,
-        });
-
-        // Get all other worktrees
-        let worktree_list = repo.worktrees()?;
-        for worktree_name in worktree_list.iter() {
-            let Some(name) = worktree_name else { continue };
-            if let Ok(worktree) = repo.find_worktree(name) {
-                worktrees.push(Worktree {
-                    name: name.to_string(),
-                    path: worktree.path().to_path_buf(),
-                    is_current: false,
-                });
-            }
+        for component in self.components.iter_mut() {
+            component.register_action_handler(self.action_tx.clone())?;
+        }
+        for component in self.components.iter_mut() {
+            component.register_config_handler(self.config.clone())?;
+        }
+        for component in self.components.iter_mut() {
+            component.init(tui.size()?)?;
         }
 
-        Ok(worktrees)
+        let action_tx = self.action_tx.clone();
+        loop {
+            self.handle_events(&mut tui).await?;
+            self.handle_actions(&mut tui)?;
+            if self.should_suspend {
+                tui.suspend()?;
+                action_tx.send(Action::Resume)?;
+                action_tx.send(Action::ClearScreen)?;
+                // tui.mouse(true);
+                tui.enter()?;
+            } else if self.should_quit {
+                tui.stop()?;
+                break;
+            }
+        }
+        tui.exit()?;
+        Ok(())
     }
 
-    /// Run the application's main loop.
-    pub fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
-        self.running = true;
-        while self.running {
-            terminal.draw(|frame| self.render(frame))?;
-            self.handle_crossterm_events()?;
+    async fn handle_events(&mut self, tui: &mut Tui) -> Result<()> {
+        let Some(event) = tui.next_event().await else {
+            return Ok(());
+        };
+        let action_tx = self.action_tx.clone();
+        match event {
+            Event::Quit => action_tx.send(Action::Quit)?,
+            Event::Tick => action_tx.send(Action::Tick)?,
+            Event::Render => action_tx.send(Action::Render)?,
+            Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
+            Event::Key(key) => self.handle_key_event(key)?,
+            _ => {}
+        }
+        for component in self.components.iter_mut() {
+            if let Some(action) = component.handle_events(Some(event.clone()))? {
+                action_tx.send(action)?;
+            }
         }
         Ok(())
     }
 
-    /// Renders the user interface.
-    ///
-    /// This is where you add new widgets. See the following resources for more information:
-    ///
-    /// - <https://docs.rs/ratatui/latest/ratatui/widgets/index.html>
-    /// - <https://github.com/ratatui/ratatui/tree/main/ratatui-widgets/examples>
-    fn render(&mut self, frame: &mut Frame) {
-        let title = Line::from("uwu - Unified Worktree Utility")
-            .bold()
-            .magenta();
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        let action_tx = self.action_tx.clone();
+        let Some(keymap) = self.config.keybindings.get(&self.mode) else {
+            return Ok(());
+        };
+        match keymap.get(&vec![key]) {
+            Some(action) => {
+                info!("Got action: {action:?}");
+                action_tx.send(action.clone())?;
+            }
+            _ => {
+                // If the key was not handled as a single key action,
+                // then consider it for multi-key combinations.
+                self.last_tick_key_events.push(key);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Header
-                Constraint::Min(0),    // List
-                Constraint::Length(3), // Footer
-            ])
-            .split(frame.area());
+                // Check for multi-key combinations
+                if let Some(action) = keymap.get(&self.last_tick_key_events) {
+                    info!("Got action: {action:?}");
+                    action_tx.send(action.clone())?;
+                }
+            }
+        }
+        Ok(())
+    }
 
-        // Header
-        frame.render_widget(
-            Paragraph::new("Git Worktrees")
-                .block(
-                    Block::bordered()
-                        .border_set(symbols::border::ROUNDED)
-                        .title(title.clone()),
-                )
-                .centered(),
-            chunks[0],
-        );
-
-        // List of worktrees
-        let items = self
-            .worktrees
-            .iter()
-            .map(|worktree| {
-                let display_text = if worktree.is_current {
-                    format!("* {} ({})", worktree.name, worktree.path.display())
-                } else {
-                    format!("  {} ({})", worktree.name, worktree.path.display())
+    fn handle_actions(&mut self, tui: &mut Tui) -> Result<()> {
+        while let Ok(action) = self.action_rx.try_recv() {
+            if action != Action::Tick && action != Action::Render {
+                debug!("{action:?}");
+            }
+            match action {
+                Action::Tick => {
+                    self.last_tick_key_events.drain(..);
+                }
+                Action::Quit => self.should_quit = true,
+                Action::Suspend => self.should_suspend = true,
+                Action::Resume => self.should_suspend = false,
+                Action::ClearScreen => tui.terminal.clear()?,
+                Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
+                Action::Render => self.render(tui)?,
+                _ => {}
+            }
+            for component in self.components.iter_mut() {
+                if let Some(action) = component.update(action.clone())? {
+                    self.action_tx.send(action)?
                 };
-                ListItem::new(display_text)
-            })
-            .collect::<Vec<_>>();
-
-        let list = List::new(items)
-            .block(Block::bordered().title("Worktrees"))
-            .highlight_style(Style::default().bg(Color::Magenta).fg(Color::Black))
-            .highlight_symbol(">> ");
-
-        frame.render_stateful_widget(list, chunks[1], &mut self.list_state);
-
-        // Footer
-        frame.render_widget(
-            Paragraph::new("Use arrow keys to navigate and Enter to select, Esc/q to quit.")
-                .block(Block::bordered())
-                .centered(),
-            chunks[2],
-        );
-    }
-
-    /// Reads the crossterm events and updates the state of [`App`].
-    ///
-    /// If your application needs to perform work in between handling events, you can use the
-    /// [`event::poll`] function to check if there are any events available with a timeout.
-    fn handle_crossterm_events(&mut self) -> Result<()> {
-        match event::read()? {
-            // it's important to check KeyEventKind::Press to avoid handling key release events
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
-            Event::Mouse(_) => {}
-            Event::Resize(_, _) => {}
-            _ => {}
+            }
         }
         Ok(())
     }
 
-    /// Moves to the previous item in the list.
-    fn prev_item(&mut self) {
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.worktrees.len() - 1 // wrap around to the last item
-                } else {
-                    i - 1
+    fn handle_resize(&mut self, tui: &mut Tui, w: u16, h: u16) -> Result<()> {
+        tui.resize(Rect::new(0, 0, w, h))?;
+        self.render(tui)?;
+        Ok(())
+    }
+
+    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+        tui.draw(|frame| {
+            for component in self.components.iter_mut() {
+                if let Err(err) = component.draw(frame, frame.area()) {
+                    let _ = self
+                        .action_tx
+                        .send(Action::Error(format!("Failed to draw: {:?}", err)));
                 }
             }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
-    }
-
-    /// Moves to the next item in the list.
-    fn next_item(&mut self) {
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i >= self.worktrees.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
-    }
-
-    /// Selects the currently highlighted item in the list.
-    fn select_item(&mut self) {
-        unimplemented!();
-    }
-
-    /// Handles the key events and updates the state of [`App`].
-    fn on_key_event(&mut self, key: KeyEvent) {
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Esc | KeyCode::Char('q'))
-            | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => self.quit(),
-            (_, KeyCode::Up) => self.prev_item(),
-            (_, KeyCode::Down) => self.next_item(),
-            (_, KeyCode::Enter) => self.select_item(),
-            _ => {}
-        }
-    }
-
-    /// Set running to false to quit the application.
-    fn quit(&mut self) {
-        self.running = false;
+        })?;
+        Ok(())
     }
 }
