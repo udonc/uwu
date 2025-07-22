@@ -102,7 +102,7 @@ impl Component for WorktreeTable {
 	}
 
 	fn draw(&mut self, frame: &mut ratatui::Frame, area: ratatui::prelude::Rect) -> Result<()> {
-		let header = Row::new(vec!["Name", "Branch", "Path"])
+		let header = Row::new(vec!["Branch", "Commit", "Path"])
 			.style(Style::default().fg(Color::Yellow))
 			.height(1);
 
@@ -111,9 +111,10 @@ impl Component for WorktreeTable {
 			.iter()
 			.map(|worktree| {
 				let branch = worktree.branch.as_deref().unwrap_or("N/A");
+				let commit = worktree.commit_hash.as_deref().unwrap_or("N/A");
 				Row::new(vec![
-					worktree.name.clone(),
 					branch.to_string(),
+					commit.to_string(),
 					worktree.path.display().to_string(),
 				])
 				.height(1)
@@ -124,7 +125,7 @@ impl Component for WorktreeTable {
 			rows,
 			[
 				ratatui::layout::Constraint::Length(15),
-				ratatui::layout::Constraint::Length(20),
+				ratatui::layout::Constraint::Length(10),
 				ratatui::layout::Constraint::Min(0),
 			],
 		)
