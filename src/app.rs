@@ -7,7 +7,7 @@ use tracing::{debug, info};
 
 use crate::{
 	action::Action,
-	components::{Component, fps::FpsCounter, home::Home},
+	components::{Component, fps::FpsCounter, worktree_table::WorktreeTable},
 	config::Config,
 	tui::{Event, Tui},
 };
@@ -37,7 +37,10 @@ impl App {
 		Ok(Self {
 			tick_rate,
 			frame_rate,
-			components: vec![Box::new(Home::new()), Box::new(FpsCounter::default())],
+			components: vec![
+				Box::new(WorktreeTable::new()),
+				Box::new(FpsCounter::default()),
+			],
 			should_quit: false,
 			should_suspend: false,
 			config: Config::new()?,
